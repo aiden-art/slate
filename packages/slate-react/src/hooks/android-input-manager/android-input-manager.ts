@@ -81,6 +81,10 @@ export function createAndroidInputManager({
   let idCounter = 0
   let insertPositionHint: StringDiff | null | false = false
 
+  let hasReceivedCompositionEnd = true
+  let lastInsertedText: string | null = null // Track the last inserted text from flush
+  let lastFlushTime: number = 0
+
   const applyPendingSelection = () => {
     const pendingSelection = EDITOR_TO_PENDING_SELECTION.get(editor)
     EDITOR_TO_PENDING_SELECTION.delete(editor)
@@ -181,8 +185,10 @@ export function createAndroidInputManager({
 
       if (diff.diff.text) {
         Editor.insertText(editor, diff.diff.text)
+        lastInsertedText = diff.diff.text
       } else {
         Editor.deleteFragment(editor)
+        lastInsertedText = null
       }
 
       // Remove diff only after we have applied it to account for it when transforming
@@ -243,11 +249,14 @@ export function createAndroidInputManager({
       editor.marks = userMarks
       editor.onChange()
     }
+
+    lastFlushTime = Date.now()
   }
 
   const handleCompositionEnd = (
     _event: React.CompositionEvent<HTMLDivElement>
   ) => {
+    hasReceivedCompositionEnd = true
     if (compositionEndTimeoutId) {
       clearTimeout(compositionEndTimeoutId)
     }
@@ -258,10 +267,59 @@ export function createAndroidInputManager({
     }, RESOLVE_DELAY)
   }
 
+  const handleCompositionDuplication = () => {
+    // https://github.com/ianstormtaylor/slate/issues/5979
+    // Fix Android IME duplication issue by selecting the prematurely inserted text
+    // so it gets overwritten by the new composition session.
+    const { selection } = editor
+    const now = Date.now()
+
+    if (
+      !hasReceivedCompositionEnd &&
+      lastInsertedText &&
+      now - lastFlushTime < 2000 &&
+      selection &&
+      Range.isCollapsed(selection)
+    ) {
+      try {
+        const { anchor } = selection
+        // Calculate the range of the last inserted text
+        // It should be immediately before the current cursor
+        const start = Editor.before(editor, anchor, {
+          distance: lastInsertedText.length,
+        })
+
+        if (start) {
+          const range = { anchor: start, focus: anchor }
+
+          // Verify if the text in this range actually matches what we think was inserted
+          const textInRange = Editor.string(editor, range)
+          if (textInRange === lastInsertedText) {
+            Transforms.select(editor, range)
+
+            // Also update the native selection immediately to ensure IME picks it up
+            const window = ReactEditor.getWindow(editor)
+            const domRange = ReactEditor.toDOMRange(editor, range)
+            const domSelection = window.getSelection()
+            if (domSelection && domRange) {
+              domSelection.removeAllRanges()
+              domSelection.addRange(domRange)
+            }
+          }
+        }
+      } catch (e) {
+        // Ignore errors
+      }
+    }
+  }
+
   const handleCompositionStart = (
     _event: React.CompositionEvent<HTMLDivElement>
   ) => {
-    debug('composition start')
+    handleCompositionDuplication()
+
+    // Reset state
+    hasReceivedCompositionEnd = false
 
     IS_COMPOSING.set(editor, true)
 
@@ -738,7 +796,6 @@ export function createAndroidInputManager({
 
   const handleInput = () => {
     if (hasPendingAction() || !hasPendingDiffs()) {
-      debug('flush input')
       flush()
     }
   }
